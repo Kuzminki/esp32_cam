@@ -1,15 +1,19 @@
 #include <Arduino.h>
+
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
-// ===== WIFI =====
-const char* ssid = "FRITZ!Box 6660 Cable BK";
-const char* password = "37434493370901593298";
+// ==========================
+// WIFI
+// ==========================
+const char* ssid = "TON_WIFI";
+const char* password = "TON_MDP";
 
-// ===== AI THINKER =====
+// ==========================
+// CAMERA AI THINKER
+// ==========================
 #define PWDN_GPIO_NUM     32
-
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
 #define SIOD_GPIO_NUM     26
@@ -23,14 +27,20 @@ const char* password = "37434493370901593298";
 #define Y4_GPIO_NUM       19
 #define Y3_GPIO_NUM       18
 #define Y2_GPIO_NUM        5
+
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-httpd_handle_t server = NULL;
+// Flash LED
+#define LED_PIN 4
 
-// ======================
+httpd_handle_t stream_httpd = NULL;
+httpd_handle_t camera_httpd = NULL;
 
+// ==========================
+// Snapshot
+// ==========================
 esp_err_t capture_handler(httpd_req_t *req)
 {
     camera_fb_t * fb = esp_camera_fb_get();
@@ -41,35 +51,94 @@ esp_err_t capture_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    httpd_resp_send(req, (const char*)fb->buf, fb->len);
 
     esp_camera_fb_return(fb);
     return ESP_OK;
 }
 
-void startServer()
+// ==========================
+// Stream MJPEG
+// ==========================
+esp_err_t stream_handler(httpd_req_t *req)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    camera_fb_t * fb = NULL;
+    esp_err_t res = ESP_OK;
 
-    httpd_start(&server, &config);
+    static const char* _STREAM_CONTENT_TYPE =
+        "multipart/x-mixed-replace;boundary=frame";
 
-    httpd_uri_t capture_uri = {
-        .uri       = "/capture",
-        .method    = HTTP_GET,
-        .handler   = capture_handler,
-        .user_ctx  = NULL
-    };
+    static const char* _STREAM_BOUNDARY = "\r\n--frame\r\n";
+    static const char* _STREAM_PART =
+        "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-    httpd_register_uri_handler(server, &capture_uri);
+    char part_buf[64];
+
+    httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+
+    digitalWrite(LED_PIN, HIGH);
+
+    while (true)
+    {
+        fb = esp_camera_fb_get();
+
+        if (!fb) {
+            res = ESP_FAIL;
+            break;
+        }
+
+        size_t hlen = snprintf(part_buf, 64, _STREAM_PART, fb->len);
+
+        httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        httpd_resp_send_chunk(req, part_buf, hlen);
+        httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+
+        esp_camera_fb_return(fb);
+
+        if (res != ESP_OK) break;
+    }
+
+    digitalWrite(LED_PIN, LOW);
+    return res;
 }
 
-// ======================
+// ==========================
+// Start Server
+// ==========================
+void startCameraServer()
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
 
-void startCamera()
+    httpd_uri_t capture_uri = {
+        .uri = "/capture",
+        .method = HTTP_GET,
+        .handler = capture_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t stream_uri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = stream_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_start(&camera_httpd, &config);
+    httpd_register_uri_handler(camera_httpd, &capture_uri);
+    httpd_register_uri_handler(camera_httpd, &stream_uri);
+}
+
+// ==========================
+// Camera Init
+// ==========================
+void setupCamera()
 {
     camera_config_t config;
+
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
+
     config.pin_d0 = Y2_GPIO_NUM;
     config.pin_d1 = Y3_GPIO_NUM;
     config.pin_d2 = Y4_GPIO_NUM;
@@ -78,17 +147,21 @@ void startCamera()
     config.pin_d5 = Y7_GPIO_NUM;
     config.pin_d6 = Y8_GPIO_NUM;
     config.pin_d7 = Y9_GPIO_NUM;
+
     config.pin_xclk = XCLK_GPIO_NUM;
     config.pin_pclk = PCLK_GPIO_NUM;
     config.pin_vsync = VSYNC_GPIO_NUM;
     config.pin_href = HREF_GPIO_NUM;
+
     config.pin_sscb_sda = SIOD_GPIO_NUM;
     config.pin_sscb_scl = SIOC_GPIO_NUM;
+
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
 
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
+
     config.frame_size = FRAMESIZE_VGA;
     config.jpeg_quality = 12;
     config.fb_count = 2;
@@ -96,30 +169,37 @@ void startCamera()
     esp_camera_init(&config);
 }
 
-// ======================
-
+// ==========================
+// Setup
+// ==========================
 void setup()
 {
     Serial.begin(115200);
 
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
     WiFi.begin(ssid, password);
 
-    while (WiFi.status() != WL_CONNECTED) {
+    while (WiFi.status() != WL_CONNECTED)
+    {
         delay(500);
         Serial.print(".");
     }
 
     Serial.println("");
-    Serial.print("IP : ");
+    Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
-    startCamera();
-    startServer();
+    setupCamera();
+    startCameraServer();
 
-    Serial.println("Serveur prêt");
-    Serial.println("Photo : /capture");
+    Serial.println("Ready");
+    Serial.println("/stream");
+    Serial.println("/capture");
 }
 
 void loop()
 {
+    delay(1000);
 }
