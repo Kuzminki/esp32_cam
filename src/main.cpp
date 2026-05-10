@@ -7,12 +7,10 @@
 // ==========================
 // WIFI
 // ==========================
-const char* ssid = "TON_WIFI";
-const char* password = "TON_MDP";
+const char* ssid = "FRITZ!Box 6660 Cable BK";
+const char* password = "37434493370901593298";
 
-// ==========================
 // CAMERA AI THINKER
-// ==========================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -32,23 +30,39 @@ const char* password = "TON_MDP";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// Flash LED
 #define LED_PIN 4
 
-httpd_handle_t stream_httpd = NULL;
-httpd_handle_t camera_httpd = NULL;
+unsigned long lastClientActivity = 0;
+bool streamActive = false;
 
-// ==========================
-// Snapshot
-// ==========================
+httpd_handle_t server = NULL;
+
+bool manualLight = true;
+
+// ======================
+// PAGE WEB
+// ======================
+esp_err_t index_handler(httpd_req_t *req)
+{
+    const char* html =
+    "<html><body>"
+    "<h2>ESP32-CAM</h2>"
+    "<img src='/stream' width='320'><br><br>"
+    "<button onclick=\"fetch('/light/on')\">Light ON</button>"
+    "<button onclick=\"fetch('/light/off')\">Light OFF</button>"
+    "</body></html>";
+
+    httpd_resp_send(req, html, strlen(html));
+    return ESP_OK;
+}
+
+// ======================
+// SNAPSHOT
+// ======================
 esp_err_t capture_handler(httpd_req_t *req)
 {
     camera_fb_t * fb = esp_camera_fb_get();
-
-    if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    if (!fb) return httpd_resp_send_500(req);
 
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_send(req, (const char*)fb->buf, fb->len);
@@ -57,81 +71,107 @@ esp_err_t capture_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// ==========================
-// Stream MJPEG
-// ==========================
+// ======================
+// STREAM
+// ======================
 esp_err_t stream_handler(httpd_req_t *req)
 {
-    camera_fb_t * fb = NULL;
-    esp_err_t res = ESP_OK;
+    camera_fb_t *fb = NULL;
 
-    static const char* _STREAM_CONTENT_TYPE =
-        "multipart/x-mixed-replace;boundary=frame";
+    const char* boundary = "\r\n--frame\r\n";
+    const char* part = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+    char header[64];
 
-    static const char* _STREAM_BOUNDARY = "\r\n--frame\r\n";
-    static const char* _STREAM_PART =
-        "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+    httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
 
-    char part_buf[64];
+    Serial.println("Stream START");
 
-    httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-
+    // LED ON uniquement si pas forcée OFF manuellement
     digitalWrite(LED_PIN, HIGH);
 
     while (true)
     {
         fb = esp_camera_fb_get();
-
-        if (!fb) {
-            res = ESP_FAIL;
+        if (!fb)
+        {
+            Serial.println("Camera capture failed");
             break;
         }
 
-        size_t hlen = snprintf(part_buf, 64, _STREAM_PART, fb->len);
+        int hlen = snprintf(header, 64, part, fb->len);
 
-        httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        httpd_resp_send_chunk(req, part_buf, hlen);
-        httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+        // Si le client est déconnecté → ces fonctions échouent → break
+        if (httpd_resp_send_chunk(req, boundary, strlen(boundary)) != ESP_OK) {
+            esp_camera_fb_return(fb);
+            break;
+        }
+
+        if (httpd_resp_send_chunk(req, header, hlen) != ESP_OK) {
+            esp_camera_fb_return(fb);
+            break;
+        }
+
+        if (httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len) != ESP_OK) {
+            esp_camera_fb_return(fb);
+            break;
+        }
 
         esp_camera_fb_return(fb);
 
-        if (res != ESP_OK) break;
+        delay(30); // contrôle FPS (~30fps max théorique)
     }
 
+    Serial.println("Stream STOP");
+
     digitalWrite(LED_PIN, LOW);
-    return res;
+
+    return ESP_OK;
 }
 
-// ==========================
-// Start Server
-// ==========================
-void startCameraServer()
+// ======================
+// LIGHT CONTROL
+// ======================
+esp_err_t light_on_handler(httpd_req_t *req)
+{
+    manualLight = true;
+    digitalWrite(LED_PIN, HIGH);
+    httpd_resp_send(req, "ON", 2);
+    return ESP_OK;
+}
+
+esp_err_t light_off_handler(httpd_req_t *req)
+{
+    manualLight = false;
+    digitalWrite(LED_PIN, LOW);
+    httpd_resp_send(req, "OFF", 3);
+    return ESP_OK;
+}
+
+// ======================
+// START SERVER
+// ======================
+void startServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
 
-    httpd_uri_t capture_uri = {
-        .uri = "/capture",
-        .method = HTTP_GET,
-        .handler = capture_handler,
-        .user_ctx = NULL
-    };
+    httpd_start(&server, &config);
 
-    httpd_uri_t stream_uri = {
-        .uri = "/stream",
-        .method = HTTP_GET,
-        .handler = stream_handler,
-        .user_ctx = NULL
-    };
+    httpd_uri_t index_uri = { "/", HTTP_GET, index_handler, NULL };
+    httpd_uri_t stream_uri = { "/stream", HTTP_GET, stream_handler, NULL };
+    httpd_uri_t capture_uri = { "/capture", HTTP_GET, capture_handler, NULL };
+    httpd_uri_t light_on_uri = { "/light/on", HTTP_GET, light_on_handler, NULL };
+    httpd_uri_t light_off_uri = { "/light/off", HTTP_GET, light_off_handler, NULL };
 
-    httpd_start(&camera_httpd, &config);
-    httpd_register_uri_handler(camera_httpd, &capture_uri);
-    httpd_register_uri_handler(camera_httpd, &stream_uri);
+    httpd_register_uri_handler(server, &index_uri);
+    httpd_register_uri_handler(server, &stream_uri);
+    httpd_register_uri_handler(server, &capture_uri);
+    httpd_register_uri_handler(server, &light_on_uri);
+    httpd_register_uri_handler(server, &light_off_uri);
 }
 
-// ==========================
-// Camera Init
-// ==========================
+// ======================
+// CAMERA INIT
+// ======================
 void setupCamera()
 {
     camera_config_t config;
@@ -169,9 +209,9 @@ void setupCamera()
     esp_camera_init(&config);
 }
 
-// ==========================
-// Setup
-// ==========================
+// ======================
+// SETUP
+// ======================
 void setup()
 {
     Serial.begin(115200);
@@ -192,13 +232,15 @@ void setup()
     Serial.println(WiFi.localIP());
 
     setupCamera();
-    startCameraServer();
+    startServer();
 
-    Serial.println("Ready");
+    Serial.println("Ready:");
+    Serial.println("/");
     Serial.println("/stream");
     Serial.println("/capture");
 }
 
+// ======================
 void loop()
 {
     delay(1000);
