@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
@@ -10,7 +9,9 @@
 const char* ssid = "FRITZ!Box 6660 Cable BK";
 const char* password = "37434493370901593298";
 
+// ==========================
 // CAMERA AI THINKER
+// ==========================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -32,12 +33,46 @@ const char* password = "37434493370901593298";
 
 #define LED_PIN 4
 
-unsigned long lastClientActivity = 0;
-bool streamActive = false;
-
 httpd_handle_t server = NULL;
 
-bool manualLight = true;
+// ==========================
+// LIGHT STATE MACHINE
+// ==========================
+enum LightMode {
+    LIGHT_OFF,
+    LIGHT_STREAM,
+    LIGHT_FLASH
+};
+
+LightMode lightMode = LIGHT_OFF;
+bool manualOverride = false;
+
+// ==========================
+// LED CONTROL CENTRALISÉ
+// ==========================
+void updateLight()
+{
+    if (manualOverride)
+        return;
+
+    switch (lightMode)
+    {
+        case LIGHT_OFF:
+            digitalWrite(LED_PIN, LOW);
+            break;
+
+        case LIGHT_STREAM:
+            digitalWrite(LED_PIN, HIGH);
+            break;
+
+        case LIGHT_FLASH:
+            digitalWrite(LED_PIN, HIGH);
+            delay(120);
+            digitalWrite(LED_PIN, LOW);
+            lightMode = LIGHT_OFF;
+            break;
+    }
+}
 
 // ======================
 // PAGE WEB
@@ -57,10 +92,24 @@ esp_err_t index_handler(httpd_req_t *req)
 }
 
 // ======================
-// SNAPSHOT
+// SNAPSHOT (TIMELAPSE)
 // ======================
 esp_err_t capture_handler(httpd_req_t *req)
 {
+    Serial.println("Capture");
+
+    lightMode = LIGHT_FLASH;
+    updateLight();
+
+    delay(1000); // stabilisation lumière
+
+    // 🔥 FLUSH frame buffer (important)
+    camera_fb_t * fb_flush = esp_camera_fb_get();
+    if (fb_flush) {
+        esp_camera_fb_return(fb_flush);
+    }
+
+    // 📸 vraie capture fraîche
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) return httpd_resp_send_500(req);
 
@@ -68,11 +117,15 @@ esp_err_t capture_handler(httpd_req_t *req)
     httpd_resp_send(req, (const char*)fb->buf, fb->len);
 
     esp_camera_fb_return(fb);
+
+    lightMode = LIGHT_OFF;
+    updateLight();
+
     return ESP_OK;
 }
 
 // ======================
-// STREAM
+// STREAM MJPEG
 // ======================
 esp_err_t stream_handler(httpd_req_t *req)
 {
@@ -86,21 +139,16 @@ esp_err_t stream_handler(httpd_req_t *req)
 
     Serial.println("Stream START");
 
-    // LED ON uniquement si pas forcée OFF manuellement
-    digitalWrite(LED_PIN, HIGH);
+    lightMode = LIGHT_STREAM;
+    updateLight();
 
     while (true)
     {
         fb = esp_camera_fb_get();
-        if (!fb)
-        {
-            Serial.println("Camera capture failed");
-            break;
-        }
+        if (!fb) break;
 
         int hlen = snprintf(header, 64, part, fb->len);
 
-        // Si le client est déconnecté → ces fonctions échouent → break
         if (httpd_resp_send_chunk(req, boundary, strlen(boundary)) != ESP_OK) {
             esp_camera_fb_return(fb);
             break;
@@ -118,22 +166,23 @@ esp_err_t stream_handler(httpd_req_t *req)
 
         esp_camera_fb_return(fb);
 
-        delay(30); // contrôle FPS (~30fps max théorique)
+        delay(30);
     }
 
     Serial.println("Stream STOP");
 
-    digitalWrite(LED_PIN, LOW);
+    lightMode = LIGHT_OFF;
+    updateLight();
 
     return ESP_OK;
 }
 
 // ======================
-// LIGHT CONTROL
+// LIGHT CONTROL API
 // ======================
 esp_err_t light_on_handler(httpd_req_t *req)
 {
-    manualLight = true;
+    manualOverride = true;
     digitalWrite(LED_PIN, HIGH);
     httpd_resp_send(req, "ON", 2);
     return ESP_OK;
@@ -141,19 +190,19 @@ esp_err_t light_on_handler(httpd_req_t *req)
 
 esp_err_t light_off_handler(httpd_req_t *req)
 {
-    manualLight = false;
-    digitalWrite(LED_PIN, LOW);
+    manualOverride = false;
+    lightMode = LIGHT_OFF;
+    updateLight();
     httpd_resp_send(req, "OFF", 3);
     return ESP_OK;
 }
 
 // ======================
-// START SERVER
+// SERVER
 // ======================
 void startServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
     httpd_start(&server, &config);
 
     httpd_uri_t index_uri = { "/", HTTP_GET, index_handler, NULL };
@@ -193,8 +242,8 @@ void setupCamera()
     config.pin_vsync = VSYNC_GPIO_NUM;
     config.pin_href = HREF_GPIO_NUM;
 
-    config.pin_sscb_sda = SIOD_GPIO_NUM;
-    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
 
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
@@ -202,9 +251,10 @@ void setupCamera()
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
 
+    config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size = FRAMESIZE_VGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 2;
+    config.jpeg_quality = 10; // 🔥 améliore qualité (12 = plus compressé)
+    config.fb_count = 1;
 
     esp_camera_init(&config);
 }
@@ -235,7 +285,6 @@ void setup()
     startServer();
 
     Serial.println("Ready:");
-    Serial.println("/");
     Serial.println("/stream");
     Serial.println("/capture");
 }
@@ -243,5 +292,6 @@ void setup()
 // ======================
 void loop()
 {
-    delay(1000);
+    updateLight();
+    delay(10);
 }
