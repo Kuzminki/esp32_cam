@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include <ArduinoOTA.h> // Include for OTA functionality
 
 // ==========================
 // WIFI
@@ -46,6 +47,12 @@ enum LightMode {
 
 LightMode lightMode = LIGHT_OFF;
 bool manualOverride = false;
+
+// ==========================
+// OTA (Over-The-Air) UPDATE
+// ==========================
+const char* ota_hostname = "esp32cam-server"; // How your device will appear on the network for OTA
+const char* ota_password = "your_ota_password"; // IMPORTANT: Change this to a strong password!
 
 // ==========================
 // LED CONTROL CENTRALISÉ
@@ -281,6 +288,37 @@ void setup()
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
+    // Configure OTA
+    ArduinoOTA.setHostname(ota_hostname);
+    ArduinoOTA.setPassword(ota_password); // Set your OTA password here!
+
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) {
+            type = "sketch";
+        } else { // U_SPIFFS
+            type = "filesystem";
+        }
+        // NOTE: if updating FS this would be the place to unmount SPIFFS using SPIFFS.end()
+        Serial.println("Start updating " + type);
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("\nEnd");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+    ArduinoOTA.begin();
+    Serial.println("OTA Initialized");
+
     setupCamera();
     startServer();
 
@@ -292,6 +330,7 @@ void setup()
 // ======================
 void loop()
 {
+    ArduinoOTA.handle(); // Crucial for processing OTA updates
     updateLight();
     delay(10);
 }
