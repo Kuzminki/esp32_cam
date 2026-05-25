@@ -6,8 +6,8 @@
 // ==========================
 // WIFI
 // ==========================
-const char* ssid = "FRITZ!Box 6660 Cable BK";
-const char* password = "37434493370901593298";
+const char* ssid = "Pushkinsky Dom";
+const char* password = "MalayaOrdinka3";
 
 // ==========================
 // CAMERA AI THINKER
